@@ -17,8 +17,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "dataset"
 TRAIN_DIR = DATA_DIR / "train"
 TEST_DIR = DATA_DIR / "test"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = PROJECT_ROOT / "output"  # Final submission files only
 LOG_DIR = PROJECT_ROOT / "logs"
+
+# ---------------------------------------------------------------------------
+# Intermediate processing paths (blocking, splits, and model-preparation data)
+# ---------------------------------------------------------------------------
+PROCESSING_DIR = PROJECT_ROOT / "processing"
+BLOCKING_DIR = PROCESSING_DIR / "blocking"
+TRAINING_DATA_DIR = PROCESSING_DIR / "training_data"
 
 # ---------------------------------------------------------------------------
 # Source file paths (train)
@@ -50,8 +57,9 @@ CLEANED_SOURCE3 = CLEANED_DIR / "cleaned_source3.tsv"
 
 # ---------------------------------------------------------------------------
 # Validation split output paths (validation_split.py writes these)
+# Stored under processing/, not output/; output/ is reserved for final submissions.
 # ---------------------------------------------------------------------------
-SPLIT_DIR = OUTPUT_DIR / "splits"
+SPLIT_DIR = PROCESSING_DIR / "splits"
 TRAIN_SOURCE1_IDS = SPLIT_DIR / "train_source1_ids.txt"
 VAL_SOURCE1_IDS = SPLIT_DIR / "val_source1_ids.txt"
 TRAIN_GROUND_TRUTH_SPLIT = SPLIT_DIR / "train_ground_truth.tsv"
@@ -240,7 +248,7 @@ ABBREV_DICTS: dict[str, dict[str, str]] = {
         "pin":   "pin",         # PIN code prefix — keep
     },
     "generic": {
-        # Shared expansions safe for any country
+        # Shared expansions safe for any country   
         "rd":    "road",
         "rd.":   "road",
         "st":    "street",

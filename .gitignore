@@ -1,0 +1,8 @@
+# Ignore the entire dataset folder
+__pycache__/
+*.py[cod]
+
+dataset/
+cleaned_dataset/
+logs/
+processing/

@@ -317,7 +317,7 @@ def series_extract_first_match(series: pd.Series, pattern: re.Pattern) -> pd.Ser
     # str.findall accepts a compiled Pattern object — no re-compilation.
     found_lists = series.str.findall(pattern)
     # found_lists is a Series of lists; take first element or pd.NA
-    result = found_lists.apply(lambda lst: lst[0].strip() if lst else pd.NA)
+    result = found_lists.apply(lambda lst: lst[0].strip() if isinstance(lst, list) and lst else pd.NA)
     # Coerce empty strings to pd.NA
     result = result.where(result.notna() & (result.str.len() > 0), pd.NA)
     return result
