@@ -28,6 +28,42 @@ BLOCKING_DIR = PROCESSING_DIR / "blocking"
 TRAINING_DATA_DIR = PROCESSING_DIR / "training_data"
 
 # ---------------------------------------------------------------------------
+# Blocking / candidate-generation paths
+# Keep all blocking intermediates under processing/blocking/ so they never
+# mingle with the final submission outputs under output/.
+# ---------------------------------------------------------------------------
+TRAIN_POOL_SQLITE = BLOCKING_DIR / "train_pool.sqlite"
+TEST_POOL_SQLITE = BLOCKING_DIR / "test_pool.sqlite"
+TRAIN_ADDRESS_INDEX = BLOCKING_DIR / "train_address_index.sqlite"
+TEST_ADDRESS_INDEX = BLOCKING_DIR / "test_address_index.sqlite"
+TRAIN_CANDIDATE_PAIRS = BLOCKING_DIR / "candidate_pairs_train.tsv"
+TEST_CANDIDATE_PAIRS = BLOCKING_DIR / "candidate_pairs_test.tsv"
+
+
+def get_blocking_paths(mode: str) -> dict[str, Path]:
+    """Return train/test path mapping for the pool and candidate-generation stages."""
+    normalized_mode = (mode or TRAIN_MODE).lower()
+    if normalized_mode == TRAIN_MODE:
+        return {
+            "source2": CLEANED_SOURCE2,
+            "source3": CLEANED_SOURCE3,
+            "pool_db": TRAIN_POOL_SQLITE,
+            "address_index": TRAIN_ADDRESS_INDEX,
+            "candidate_pairs": TRAIN_CANDIDATE_PAIRS,
+            "source1": CLEANED_SOURCE1,
+        }
+    if normalized_mode == TEST_MODE:
+        return {
+            "source2": CLEANED_TEST_SOURCE2,
+            "source3": CLEANED_TEST_SOURCE3,
+            "pool_db": TEST_POOL_SQLITE,
+            "address_index": TEST_ADDRESS_INDEX,
+            "candidate_pairs": TEST_CANDIDATE_PAIRS,
+            "source1": CLEANED_TEST_SOURCE1,
+        }
+    raise ValueError(f"Unsupported blocking mode: {mode!r}. Expected one of: {CLEANING_MODES}")
+
+# ---------------------------------------------------------------------------
 # Source file paths (train)
 # ---------------------------------------------------------------------------
 TRAIN_SOURCE1 = TRAIN_DIR / "train_source1.tsv"
@@ -43,6 +79,13 @@ TEST_SOURCE2 = TEST_DIR / "test_source2.tsv"
 TEST_SOURCE3 = TEST_DIR / "test_source3.tsv"
 
 # ---------------------------------------------------------------------------
+# Cleaning modes
+# ---------------------------------------------------------------------------
+TRAIN_MODE: str = "train"
+TEST_MODE: str = "test"
+CLEANING_MODES: tuple[str, str] = (TRAIN_MODE, TEST_MODE)
+
+# ---------------------------------------------------------------------------
 # Cleaned output paths (data_cleaning.py writes these)
 #
 # Root-level folder (sibling to dataset/, output/, src/), not nested under
@@ -54,6 +97,27 @@ CLEANED_DIR = PROJECT_ROOT / "cleaned_dataset"
 CLEANED_SOURCE1 = CLEANED_DIR / "cleaned_source1.tsv"
 CLEANED_SOURCE2 = CLEANED_DIR / "cleaned_source2.tsv"
 CLEANED_SOURCE3 = CLEANED_DIR / "cleaned_source3.tsv"
+CLEANED_TEST_SOURCE1 = CLEANED_DIR / "cleaned_test_source1.tsv"
+CLEANED_TEST_SOURCE2 = CLEANED_DIR / "cleaned_test_source2.tsv"
+CLEANED_TEST_SOURCE3 = CLEANED_DIR / "cleaned_test_source3.tsv"
+
+
+def get_cleaning_tasks(mode: str) -> list[tuple[Path, Path, str]]:
+    """Return the input/output/source-label tuples for the requested mode."""
+    normalized_mode = (mode or TRAIN_MODE).lower()
+    if normalized_mode == TRAIN_MODE:
+        return [
+            (TRAIN_SOURCE1, CLEANED_SOURCE1, "train_source1"),
+            (TRAIN_SOURCE2, CLEANED_SOURCE2, "train_source2"),
+            (TRAIN_SOURCE3, CLEANED_SOURCE3, "train_source3"),
+        ]
+    if normalized_mode == TEST_MODE:
+        return [
+            (TEST_SOURCE1, CLEANED_TEST_SOURCE1, "test_source1"),
+            (TEST_SOURCE2, CLEANED_TEST_SOURCE2, "test_source2"),
+            (TEST_SOURCE3, CLEANED_TEST_SOURCE3, "test_source3"),
+        ]
+    raise ValueError(f"Unsupported cleaning mode: {mode!r}. Expected one of: {CLEANING_MODES}")
 
 # ---------------------------------------------------------------------------
 # Validation split output paths (validation_split.py writes these)

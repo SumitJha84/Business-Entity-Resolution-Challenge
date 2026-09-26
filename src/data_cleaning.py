@@ -404,7 +404,7 @@ class QualityAccumulator:
 SOURCE_COLS = ["entity_id", "business_name", "business_address", "country"]
 
 
-def _iter_chunks(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
+def _iter_chunks(path: Path, chunk_size: int, limit: int | None = None) -> Iterator[pd.DataFrame]:
     """Yield TSV chunks from a file.  Raises FileNotFoundError if missing."""
     if not path.exists():
         raise FileNotFoundError(f"Source file not found: {path}")
@@ -418,11 +418,18 @@ def _iter_chunks(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
         encoding="utf-8",
         encoding_errors="replace",  # handle encoding glitches (e.g., non-UTF-8 Hindi chars)
     )
+    rows_seen = 0
     for chunk in reader:
+        if limit is not None and rows_seen >= limit:
+            break
+        remaining = None if limit is None else limit - rows_seen
+        if remaining is not None and len(chunk) > remaining:
+            chunk = chunk.iloc[:remaining].copy()
         # Ensure expected columns exist
         for col in SOURCE_COLS:
             if col not in chunk.columns:
                 chunk[col] = pd.NA
+        rows_seen += len(chunk)
         yield chunk
 
 
@@ -457,6 +464,7 @@ def clean_source(
     source_label: str,
     chunk_size: int,
     logger: logging.Logger,
+    limit: int | None = None,
 ) -> dict:
     """
     Read input_path in chunks, clean each chunk, write to output_path.
@@ -468,8 +476,10 @@ def clean_source(
     t0 = time.time()
 
     logger.info(f"[{source_label}] Starting cleaning → {output_path}")
+    if limit is not None:
+        logger.info(f"[{source_label}] Total row limit: {limit:,} records")
 
-    for chunk_idx, chunk in enumerate(_iter_chunks(input_path, chunk_size)):
+    for chunk_idx, chunk in enumerate(_iter_chunks(input_path, chunk_size, limit=limit)):
         cleaned = clean_chunk(chunk)
         accumulator.update(cleaned, SOURCE_COLS)
 
@@ -491,6 +501,12 @@ def clean_source(
                 f"[{source_label}] Processed chunk {chunk_idx} "
                 f"({accumulator.total_rows:,} rows so far, {elapsed:.1f}s)"
             )
+
+        if limit is not None and accumulator.total_rows >= limit:
+            logger.info(
+                f"[{source_label}] Reached total row limit of {limit:,}; stopping cleanly."
+            )
+            break
 
     elapsed = time.time() - t0
     report = accumulator.to_dict()
@@ -538,20 +554,33 @@ def parse_args() -> argparse.Namespace:
         description="Stage 1: Data cleaning and normalisation for ER pipeline."
     )
     p.add_argument(
+        "--mode",
+        choices=cfg.CLEANING_MODES,
+        default=cfg.TRAIN_MODE,
+        help="Dataset mode to clean: train or test.",
+    )
+    p.add_argument(
         "--chunk-size",
         type=int,
         default=cfg.CHUNK_SIZE,
         help=f"Rows per chunk (default: {cfg.CHUNK_SIZE})",
     )
     p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum total rows to process for each source file before stopping. "
+             "Applies per source, not per chunk.",
+    )
+    p.add_argument(
         "--source1-only",
         action="store_true",
-        help="Clean only train_source1 (faster iteration).",
+        help="Clean only the selected mode's Source1 file (faster iteration).",
     )
     p.add_argument(
         "--include-test",
         action="store_true",
-        help="Also clean the test source files.",
+        help="Backward-compatible: also clean the test files when running in train mode.",
     )
     p.add_argument(
         "--output-dir",
@@ -573,46 +602,35 @@ def main() -> None:
     out_dir: Path = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    mode = args.mode.lower()
+    tasks = cfg.get_cleaning_tasks(mode)
+    if args.source1_only:
+        tasks = tasks[:1]
+        logger.info(f"--source1-only flag set: cleaning only {mode} Source1.")
+
+    if args.include_test and mode == cfg.TRAIN_MODE:
+        logger.info("--include-test passed: also cleaning test sources after train sources.")
+        tasks = tasks + cfg.get_cleaning_tasks(cfg.TEST_MODE)
+
     logger.info("=" * 60)
     logger.info("Data Cleaning Stage — START")
+    logger.info(f"Mode: {mode}")
     logger.info(f"Chunk size: {chunk_size:,}")
     logger.info(f"Output dir: {out_dir}")
     logger.info("=" * 60)
 
     reports: list[dict] = []
 
-    # --- Train sources ---
-    train_tasks = [
-        (cfg.TRAIN_SOURCE1, out_dir / "cleaned_source1.tsv", "train_source1"),
-        (cfg.TRAIN_SOURCE2, out_dir / "cleaned_source2.tsv", "train_source2"),
-        (cfg.TRAIN_SOURCE3, out_dir / "cleaned_source3.tsv", "train_source3"),
-    ]
-    if args.source1_only:
-        train_tasks = train_tasks[:1]
-        logger.info("--source1-only flag set: cleaning only train_source1.")
-
-    for inp, outp, label in train_tasks:
+    for inp, outp, label in tasks:
+        # Keep output filenames aligned to the selected mode while reusing the
+        # same chunk-wise cleaning implementation for both train and test.
+        out_path = out_dir / outp.name
         try:
-            report = clean_source(inp, outp, label, chunk_size, logger)
+            report = clean_source(inp, out_path, label, chunk_size, logger, limit=args.limit)
             save_quality_report(report, label)
             reports.append(report)
         except FileNotFoundError as exc:
             logger.error(str(exc))
-
-    # --- Test sources (optional) ---
-    if args.include_test:
-        test_tasks = [
-            (cfg.TEST_SOURCE1, out_dir / "cleaned_test_source1.tsv", "test_source1"),
-            (cfg.TEST_SOURCE2, out_dir / "cleaned_test_source2.tsv", "test_source2"),
-            (cfg.TEST_SOURCE3, out_dir / "cleaned_test_source3.tsv", "test_source3"),
-        ]
-        for inp, outp, label in test_tasks:
-            try:
-                report = clean_source(inp, outp, label, chunk_size, logger)
-                save_quality_report(report, label)
-                reports.append(report)
-            except FileNotFoundError as exc:
-                logger.error(str(exc))
 
     # --- Summary ---
     logger.info("=" * 60)

@@ -1,8 +1,11 @@
-# Ignore the entire dataset folder
+# Python cache files
 __pycache__/
 *.py[cod]
 
+# Dataset folders
 dataset/
 cleaned_dataset/
+
+# Logs and generated processing data
 logs/
 processing/

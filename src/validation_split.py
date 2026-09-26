@@ -514,6 +514,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Stage 2: Ground-truth validation and stratified train/val split."
     )
+    p.add_argument(
+        "--mode",
+        choices=(cfg.TRAIN_MODE, cfg.TEST_MODE),
+        default=cfg.TRAIN_MODE,
+        help="Validation splitting is only supported for the training dataset; test data has no ground truth.",
+    )
     p.add_argument("--val-fraction", type=float, default=cfg.VAL_FRACTION)
     p.add_argument("--seed", type=int, default=cfg.RANDOM_SEED)
     p.add_argument("--chunk-size", type=int, default=cfg.CHUNK_SIZE)
@@ -527,11 +533,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.mode != cfg.TRAIN_MODE:
+        raise SystemExit(
+            "Validation splitting is only supported in training mode because test data has no ground truth. "
+            "Use `python -m src.data_cleaning --mode test` for test cleaning instead."
+        )
+
     log_path = cfg.SPLIT_LOG_PATH
     logger = _setup_logger("validation_split", log_path)
 
     logger.info("=" * 60)
     logger.info("Validation Split Stage — START")
+    logger.info(f"  mode:              {args.mode}")
     logger.info(f"  val_fraction:      {args.val_fraction}")
     logger.info(f"  seed:              {args.seed}")
     logger.info(f"  chunk_size:        {args.chunk_size:,}")
