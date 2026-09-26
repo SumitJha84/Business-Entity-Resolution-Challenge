@@ -18,6 +18,7 @@ DATA_DIR = PROJECT_ROOT / "dataset"
 TRAIN_DIR = DATA_DIR / "train"
 TEST_DIR = DATA_DIR / "test"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+BLOCKING_DIR = PROJECT_ROOT / "processing" / "blocking"
 LOG_DIR = PROJECT_ROOT / "logs"
 
 # ---------------------------------------------------------------------------

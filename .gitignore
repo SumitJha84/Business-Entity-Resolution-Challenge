@@ -1,0 +1,13 @@
+
+# Local data and generated results
+.venv/
+__pycache__/
+*.pyc
+dataset/
+train/
+test/
+cleaned_dataset/
+logs/
+output/
+
+processing/blocking/*.tsv
