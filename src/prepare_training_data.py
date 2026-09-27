@@ -25,7 +25,8 @@ Outputs
 
 The script never re-splits Source1 entities. Train/validation assignment comes
 only from the Stage 2 ID lists. Candidate pairs are processed in chunks so the
-large blocking file is never loaded fully into memory.
+large blocking file is never loaded fully into memory. Similarity features use
+RapidFuzz `cpdist`, which compares corresponding rows and returns one score per pair.
 
 Usage
 -----
@@ -38,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -45,6 +47,7 @@ from pathlib import Path
 from typing import Iterator
 
 import pandas as pd
+from rapidfuzz import fuzz, process
 
 # Allow `python -m src.prepare_training_data` to import config.py in the same
 # way as the existing Stage 1/2 scripts.
@@ -57,8 +60,27 @@ OUTPUT_COLUMNS = [
     "source1_entity_id",
     "candidate_entity_id",
     "source",
+    "name_similarity",
+    "address_similarity",
+    "country_match",
     "label",
 ]
+
+FEATURE_COLUMNS = [
+    "name_similarity",
+    "address_similarity",
+    "country_match",
+]
+
+CLEANED_FEATURE_COLUMNS = [
+    "entity_id",
+    "business_name_norm",
+    "business_address_norm",
+    "country_norm",
+]
+
+CANDIDATE_POOL_PATH = cfg.BLOCKING_DIR / "train_pool.sqlite"
+SOURCE1_FEATURE_DB_PATH = cfg.BLOCKING_DIR / "stage3_source1_feature_lookup.sqlite"
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +393,446 @@ def validate_candidates(
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Candidate labeling
+# Step 3: Feature lookup / extraction
+# ---------------------------------------------------------------------------
+
+
+def _sqlite_read_only_connection(path: Path) -> sqlite3.Connection:
+    """Open a SQLite database read-only so Stage 3 cannot mutate the pool."""
+    if not path.exists():
+        raise FileNotFoundError(f"Required SQLite feature pool not found: {path}")
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _source1_feature_db_is_current(path: Path) -> bool:
+    """Return True when the cached Source1 lookup matches the current cleaned file."""
+    if not path.exists() or not cfg.CLEANED_SOURCE1.exists():
+        return False
+
+    try:
+        source_stat = cfg.CLEANED_SOURCE1.stat()
+        with sqlite3.connect(path) as conn:
+            row = conn.execute(
+                """
+                SELECT source_size, source_mtime_ns
+                FROM metadata
+                WHERE key = 'cleaned_source1'
+                """
+            ).fetchone()
+        return bool(
+            row
+            and int(row[0]) == int(source_stat.st_size)
+            and int(row[1]) == int(source_stat.st_mtime_ns)
+        )
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
+def _build_source1_feature_lookup(
+    db_path: Path,
+    chunk_size: int,
+    logger: logging.Logger,
+) -> Path:
+    """
+    Build a disk-backed Source1 lookup from cleaned_source1.tsv.
+
+    Only the fields required for feature extraction are stored. The cleaned
+    Source1 file is read in chunks, so the full 2.2M-row file is never loaded
+    into memory.
+    """
+    source_path = Path(cfg.CLEANED_SOURCE1)
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"Cleaned Source1 file required for feature extraction was not found: "
+            f"{source_path}"
+        )
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = db_path.with_name(db_path.name + ".tmp")
+    temp_path.unlink(missing_ok=True)
+
+    source_stat = source_path.stat()
+    total_rows = 0
+    ignored_duplicates = 0
+
+    logger.info(
+        f"Building Source1 feature lookup from {source_path} -> {db_path}"
+    )
+
+    try:
+        with sqlite3.connect(temp_path) as conn:
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute(
+                """
+                CREATE TABLE records (
+                    entity_id TEXT PRIMARY KEY,
+                    business_name_norm TEXT,
+                    business_address_norm TEXT,
+                    country_norm TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    source_size INTEGER NOT NULL,
+                    source_mtime_ns INTEGER NOT NULL,
+                    source_rows INTEGER NOT NULL
+                )
+                """
+            )
+
+            insert_sql = """
+                INSERT OR IGNORE INTO records (
+                    entity_id,
+                    business_name_norm,
+                    business_address_norm,
+                    country_norm
+                )
+                VALUES (?, ?, ?, ?)
+            """
+
+            for chunk_idx, chunk in enumerate(
+                _iter_tsv_chunks(source_path, chunk_size), start=1
+            ):
+                missing = set(CLEANED_FEATURE_COLUMNS) - set(chunk.columns)
+                if missing:
+                    raise ValueError(
+                        f"Cleaned Source1 file {source_path} is missing required "
+                        f"feature columns: {sorted(missing)}"
+                    )
+
+                feature_chunk = chunk[CLEANED_FEATURE_COLUMNS].fillna("").astype(str)
+                before = conn.total_changes
+                conn.executemany(
+                    insert_sql,
+                    feature_chunk.itertuples(index=False, name=None),
+                )
+                inserted = conn.total_changes - before
+                ignored_duplicates += len(feature_chunk) - inserted
+                total_rows += len(feature_chunk)
+
+                if chunk_idx % 10 == 0:
+                    logger.info(
+                        f"Source1 feature lookup: processed {total_rows:,} rows."
+                    )
+
+            conn.execute(
+                """
+                CREATE INDEX idx_records_entity_id
+                ON records(entity_id)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO metadata (
+                    key, source_size, source_mtime_ns, source_rows
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    "cleaned_source1",
+                    int(source_stat.st_size),
+                    int(source_stat.st_mtime_ns),
+                    int(total_rows),
+                ),
+            )
+            conn.commit()
+
+        temp_path.replace(db_path)
+
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+    if ignored_duplicates:
+        logger.warning(
+            f"Source1 feature lookup ignored {ignored_duplicates:,} duplicate "
+            "entity_id rows while building the cache."
+        )
+
+    logger.info(
+        f"Source1 feature lookup ready: {total_rows:,} rows stored at {db_path}"
+    )
+    return db_path
+
+
+def ensure_source1_feature_lookup(
+    chunk_size: int,
+    logger: logging.Logger,
+) -> Path:
+    """Create or reuse the cached Source1 feature lookup."""
+    if _source1_feature_db_is_current(SOURCE1_FEATURE_DB_PATH):
+        logger.info(
+            f"Reusing current Source1 feature lookup: {SOURCE1_FEATURE_DB_PATH}"
+        )
+        return SOURCE1_FEATURE_DB_PATH
+
+    logger.info("Source1 feature lookup is missing or stale; rebuilding it.")
+    return _build_source1_feature_lookup(
+        SOURCE1_FEATURE_DB_PATH,
+        chunk_size,
+        logger,
+    )
+
+
+def _validate_candidate_pool_schema(pool_conn: sqlite3.Connection) -> None:
+    """Validate the existing train S2/S3 pool used for candidate generation."""
+    try:
+        rows = pool_conn.execute("PRAGMA table_info(pool)").fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            f"Could not inspect the candidate SQLite pool schema: {exc}"
+        ) from exc
+
+    columns = {str(row[1]) for row in rows}
+    required = {"entity_id", "name", "address", "country"}
+    missing = required - columns
+    if missing:
+        raise RuntimeError(
+            "The existing train candidate pool does not contain the fields "
+            f"required for feature extraction: {sorted(missing)}"
+        )
+
+
+def _load_source1_records(
+    conn: sqlite3.Connection,
+    entity_ids: set[str],
+) -> pd.DataFrame:
+    """Load only the Source1 records needed by one candidate chunk."""
+    columns = [
+        "entity_id",
+        "business_name_norm",
+        "business_address_norm",
+        "country_norm",
+    ]
+    if not entity_ids:
+        return pd.DataFrame(columns=columns)
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS requested_source1_ids (
+            entity_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    conn.execute("DELETE FROM requested_source1_ids")
+    conn.executemany(
+        "INSERT OR IGNORE INTO requested_source1_ids(entity_id) VALUES (?)",
+        ((entity_id,) for entity_id in entity_ids),
+    )
+
+    query = """
+        SELECT
+            r.entity_id,
+            r.business_name_norm,
+            r.business_address_norm,
+            r.country_norm
+        FROM records AS r
+        INNER JOIN requested_source1_ids AS q
+            ON r.entity_id = q.entity_id
+    """
+    return pd.read_sql_query(query, conn).fillna("")
+
+
+def _load_candidate_records(
+    conn: sqlite3.Connection,
+    entity_ids: set[str],
+) -> pd.DataFrame:
+    """
+    Load only the candidate S2/S3 records needed by one candidate chunk.
+
+    The existing training candidate pool stores normalized values in columns
+    named country/name/address, so they are mapped back to the feature schema.
+    """
+    columns = [
+        "entity_id",
+        "business_name_norm",
+        "business_address_norm",
+        "country_norm",
+    ]
+    if not entity_ids:
+        return pd.DataFrame(columns=columns)
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS requested_candidate_ids (
+            entity_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    conn.execute("DELETE FROM requested_candidate_ids")
+    conn.executemany(
+        "INSERT OR IGNORE INTO requested_candidate_ids(entity_id) VALUES (?)",
+        ((entity_id,) for entity_id in entity_ids),
+    )
+
+    query = """
+        SELECT
+            p.entity_id,
+            p.name AS business_name_norm,
+            p.address AS business_address_norm,
+            p.country AS country_norm
+        FROM pool AS p
+        INNER JOIN requested_candidate_ids AS q
+            ON p.entity_id = q.entity_id
+    """
+    return pd.read_sql_query(query, conn).fillna("")
+
+
+def _rapidfuzz_pairwise_ratio(
+    left: pd.Series,
+    right: pd.Series,
+) -> pd.Series:
+    """
+    Compute corresponding RapidFuzz ratios for two aligned Series.
+
+    Blank values are assigned 0.0 so that ratio("", "") never becomes 1.0.
+    The two Series must have the same length and index so that the returned
+    scores remain aligned with the input rows.
+    """
+    if len(left) != len(right):
+        raise ValueError(
+            "RapidFuzz pairwise inputs must have the same length: "
+            f"left={len(left)}, right={len(right)}."
+        )
+
+    if not left.index.equals(right.index):
+        raise ValueError(
+            "RapidFuzz pairwise inputs must have identical indexes so that "
+            "scores remain aligned with the corresponding candidate rows."
+        )
+
+    left = left.fillna("").astype(str)
+    right = right.fillna("").astype(str)
+
+    scores = pd.Series(0.0, index=left.index, dtype="float64")
+    valid = left.ne("") & right.ne("")
+
+    if valid.any():
+        # cpdist() compares corresponding elements (row i with row i) and
+        # returns one score per pair. It is intentionally preserved here;
+        # replacing it with cdist() would create an unnecessary n x n matrix.
+        values = process.cpdist(
+            left.loc[valid].tolist(),
+            right.loc[valid].tolist(),
+            scorer=fuzz.ratio,
+            workers=-1,
+            dtype=float,
+        )
+        values = pd.Series(values, index=left.loc[valid].index, dtype="float64")
+        scores.loc[valid] = values / 100.0
+
+    return scores
+
+
+def extract_pair_features(
+    labeled: pd.DataFrame,
+    source1_records: pd.DataFrame,
+    candidate_records: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """
+    Add name/address/country features to already-labeled candidate pairs.
+
+    The left join guarantees that missing business records do not discard
+    candidate pairs. Missing fields simply produce zero-valued features.
+    """
+    if labeled.empty:
+        empty = labeled.copy()
+        empty["name_similarity"] = pd.Series(dtype="float64")
+        empty["address_similarity"] = pd.Series(dtype="float64")
+        empty["country_match"] = pd.Series(dtype="int8")
+        return empty[OUTPUT_COLUMNS], {
+            "missing_source1_records": 0,
+            "missing_candidate_records": 0,
+        }
+
+    s1 = source1_records[
+        [
+            "entity_id",
+            "business_name_norm",
+            "business_address_norm",
+            "country_norm",
+        ]
+    ].copy()
+    s1.columns = [
+        "source1_entity_id",
+        "s1_business_name_norm",
+        "s1_business_address_norm",
+        "s1_country_norm",
+    ]
+
+    candidates = candidate_records[
+        [
+            "entity_id",
+            "business_name_norm",
+            "business_address_norm",
+            "country_norm",
+        ]
+    ].copy()
+    candidates.columns = [
+        "candidate_entity_id",
+        "candidate_business_name_norm",
+        "candidate_business_address_norm",
+        "candidate_country_norm",
+    ]
+
+    enriched = labeled.merge(
+        s1,
+        on="source1_entity_id",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+    enriched = enriched.merge(
+        candidates,
+        on="candidate_entity_id",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+
+    missing_source1 = int(enriched["s1_business_name_norm"].isna().sum())
+    missing_candidates = int(
+        enriched["candidate_business_name_norm"].isna().sum()
+    )
+
+    # read_sql_query().fillna("") makes existing blank values explicit; merged
+    # missing records remain NaN and are safely converted to empty strings here.
+    s1_names = enriched["s1_business_name_norm"].fillna("").astype(str)
+    c_names = enriched["candidate_business_name_norm"].fillna("").astype(str)
+    s1_addresses = enriched["s1_business_address_norm"].fillna("").astype(str)
+    c_addresses = enriched["candidate_business_address_norm"].fillna("").astype(str)
+    s1_countries = enriched["s1_country_norm"].fillna("").astype(str)
+    c_countries = enriched["candidate_country_norm"].fillna("").astype(str)
+
+    enriched["name_similarity"] = _rapidfuzz_pairwise_ratio(
+        s1_names,
+        c_names,
+    ).astype("float64")
+
+    enriched["address_similarity"] = _rapidfuzz_pairwise_ratio(
+        s1_addresses,
+        c_addresses,
+    ).astype("float64")
+
+    enriched["country_match"] = (
+        s1_countries.ne("")
+        & c_countries.ne("")
+        & s1_countries.eq(c_countries)
+    ).astype("int8")
+
+    return enriched[OUTPUT_COLUMNS], {
+        "missing_source1_records": missing_source1,
+        "missing_candidate_records": missing_candidates,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Candidate labeling
 # ---------------------------------------------------------------------------
 
 
@@ -590,7 +1051,12 @@ def parse_args() -> argparse.Namespace:
         default=cfg.TRAINING_DATA_DIR,
         help=f"Labeled pair output directory (default: {cfg.TRAINING_DATA_DIR})",
     )
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.chunk_size <= 0:
+        p.error("--chunk-size must be a positive integer.")
+
+    return args
 
 
 def main() -> None:
@@ -608,7 +1074,7 @@ def main() -> None:
     logger.info(f"Chunk size:     {args.chunk_size:,}")
     logger.info("=" * 60)
 
-    t0 = time.time()
+    t0 = time.perf_counter()
 
     true_match_pairs, true_match_by_s1, train_ids, val_ids = load_data(
         args.split_dir,
@@ -638,73 +1104,121 @@ def main() -> None:
     train_positive = train_negative = 0
     val_positive = val_negative = 0
     candidate_entity_rows = 0
+    missing_source1_feature_records = 0
+    missing_candidate_feature_records = 0
 
-    for chunk_idx, candidate_chunk in enumerate(
-        _iter_tsv_chunks(args.candidate_path, args.chunk_size),
-        start=1,
-    ):
-        candidate_entity_rows += len(candidate_chunk)
+    # Feature extraction uses the same cleaned business records as the rest of
+    # the pipeline. Source1 is indexed once on disk; S2/S3 records are read from
+    # the existing train candidate pool used to generate candidate_pairs.tsv.
+    source1_feature_db = ensure_source1_feature_lookup(args.chunk_size, logger)
+    source1_conn = sqlite3.connect(source1_feature_db)
+    pool_conn = _sqlite_read_only_connection(CANDIDATE_POOL_PATH)
 
-        # Main chunk-level validation. The zero-candidate entity inventory is
-        # captured before explosion so matched entities with no candidates are
-        # not lost from diagnostics.
-        validated, info = validate_candidates(
-            candidate_chunk,
-            train_ids,
-            val_ids,
-            logger,
-        )
+    try:
+        _validate_candidate_pool_schema(pool_conn)
 
-        malformed_candidate_count += int(info["malformed_count"])
-        orphan_source1_pair_count += int(info["orphan_pair_count"])
-        duplicate_candidate_count += int(info["duplicate_count"])
+        for chunk_idx, candidate_chunk in enumerate(
+            _iter_tsv_chunks(args.candidate_path, args.chunk_size),
+            start=1,
+        ):
+            candidate_entity_rows += len(candidate_chunk)
 
-        zero_ids = info["zero_candidate_ids"]
-        zero_candidate_total += len(zero_ids)
-
-        for s1_id in zero_ids:
-            split = "train" if s1_id in train_ids else "val"
-            if s1_id in true_match_by_s1:
-                zero_candidate_matched[split] += 1
-                if len(zero_candidate_matched_samples[split]) < 20:
-                    zero_candidate_matched_samples[split].append(s1_id)
-            else:
-                zero_candidate_singleton[split] += 1
-
-        labeled, observed_keys = label_candidates(validated, true_match_pairs)
-
-        if observed_keys:
-            observed_train_true_match_keys.update(
-                observed_keys & train_true_match_pairs
-            )
-            observed_val_true_match_keys.update(
-                observed_keys & val_true_match_pairs
+            # Main chunk-level validation. The zero-candidate entity inventory is
+            # captured before explosion so matched entities with no candidates are
+            # not lost from diagnostics.
+            validated, info = validate_candidates(
+                candidate_chunk,
+                train_ids,
+                val_ids,
+                logger,
             )
 
-        train_chunk, val_chunk = split_pairs(
-            labeled,
-            train_ids,
-            val_ids,
-            logger,
-        )
+            malformed_candidate_count += int(info["malformed_count"])
+            orphan_source1_pair_count += int(info["orphan_pair_count"])
+            duplicate_candidate_count += int(info["duplicate_count"])
 
-        save_outputs(train_chunk, val_chunk, train_path, val_path)
+            zero_ids = info["zero_candidate_ids"]
+            zero_candidate_total += len(zero_ids)
 
-        train_labels = train_chunk["label"].value_counts().to_dict()
-        val_labels = val_chunk["label"].value_counts().to_dict()
-        train_positive += int(train_labels.get(1, 0))
-        train_negative += int(train_labels.get(0, 0))
-        val_positive += int(val_labels.get(1, 0))
-        val_negative += int(val_labels.get(0, 0))
-        total_candidate_pairs += len(labeled)
+            for s1_id in zero_ids:
+                split = "train" if s1_id in train_ids else "val"
+                if s1_id in true_match_by_s1:
+                    zero_candidate_matched[split] += 1
+                    if len(zero_candidate_matched_samples[split]) < 20:
+                        zero_candidate_matched_samples[split].append(s1_id)
+                else:
+                    zero_candidate_singleton[split] += 1
 
-        if chunk_idx % 10 == 0:
-            elapsed = time.time() - t0
-            logger.info(
-                f"Processed candidate chunk {chunk_idx:,}: "
-                f"{total_candidate_pairs:,} labeled pairs so far; "
-                f"{elapsed:.1f}s elapsed."
+            labeled, observed_keys = label_candidates(validated, true_match_pairs)
+
+            # Extract features for the same labeled pair rows. Both lookups are
+            # limited to IDs present in this chunk, so no full business dataset is
+            # loaded into memory.
+            source1_ids_for_features = set(
+                labeled["source1_entity_id"].astype(str).unique().tolist()
             )
+            candidate_ids_for_features = set(
+                labeled["candidate_entity_id"].astype(str).unique().tolist()
+            )
+
+            source1_records = _load_source1_records(
+                source1_conn,
+                source1_ids_for_features,
+            )
+            candidate_records = _load_candidate_records(
+                pool_conn,
+                candidate_ids_for_features,
+            )
+
+            labeled, feature_info = extract_pair_features(
+                labeled,
+                source1_records,
+                candidate_records,
+            )
+
+            missing_source1_feature_records += int(
+                feature_info["missing_source1_records"]
+            )
+            missing_candidate_feature_records += int(
+                feature_info["missing_candidate_records"]
+            )
+
+            if observed_keys:
+                observed_train_true_match_keys.update(
+                    observed_keys & train_true_match_pairs
+                )
+                observed_val_true_match_keys.update(
+                    observed_keys & val_true_match_pairs
+                )
+
+            train_chunk, val_chunk = split_pairs(
+                labeled,
+                train_ids,
+                val_ids,
+                logger,
+            )
+
+            save_outputs(train_chunk, val_chunk, train_path, val_path)
+
+            train_labels = train_chunk["label"].value_counts().to_dict()
+            val_labels = val_chunk["label"].value_counts().to_dict()
+            train_positive += int(train_labels.get(1, 0))
+            train_negative += int(train_labels.get(0, 0))
+            val_positive += int(val_labels.get(1, 0))
+            val_negative += int(val_labels.get(0, 0))
+            total_candidate_pairs += len(labeled)
+
+            if chunk_idx % 10 == 0:
+                elapsed = time.perf_counter() - t0
+                logger.info(
+                    f"Processed candidate chunk {chunk_idx:,}: "
+                    f"{total_candidate_pairs:,} labeled pairs so far; "
+                    f"{elapsed:.1f}s elapsed."
+                )
+
+    finally:
+        source1_conn.close()
+        pool_conn.close()
 
     # Blocking recall is computed against all true-match keys, not against the
     # negative candidate stream.
@@ -737,6 +1251,15 @@ def main() -> None:
         "malformed_candidate_count": int(malformed_candidate_count),
         "orphan_source1_pair_count_excluded": int(orphan_source1_pair_count),
         "duplicate_candidate_within_row_count": int(duplicate_candidate_count),
+        "feature_extraction": {
+            "name_similarity": "RapidFuzz fuzz.ratio / 100 using cleaned business_name_norm",
+            "address_similarity": "RapidFuzz fuzz.ratio / 100 using cleaned business_address_norm",
+            "country_match": "1 only when both cleaned country_norm values are non-empty and equal",
+            "missing_source1_record_count": int(missing_source1_feature_records),
+            "missing_candidate_record_count": int(missing_candidate_feature_records),
+            "feature_lookup_db": str(source1_feature_db),
+            "candidate_pool_db": str(CANDIDATE_POOL_PATH),
+        },
         "class_balance": {
             "train": {
                 "positive": int(train_positive),
@@ -780,6 +1303,8 @@ def main() -> None:
             "IDs are compared without stripping or normalization.",
             "Train/validation assignment comes exclusively from Stage 2 Source1 ID lists.",
             "Empty candidate lists produce zero pair rows; they are tracked only in entity-level diagnostics.",
+            "Feature similarity is computed from cleaned business_name_norm and business_address_norm values using RapidFuzz fuzz.ratio.",
+            "Missing business records or field values are retained and receive zero-valued similarity/country features.",
         ],
     }
 
@@ -788,7 +1313,7 @@ def main() -> None:
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - t0
 
     logger.info("=" * 60)
     logger.info("Prepare Training Data Stage — COMPLETE")
@@ -797,6 +1322,11 @@ def main() -> None:
     logger.info(
         f"Train labels: +{train_positive:,} / -{train_negative:,}; "
         f"Val labels: +{val_positive:,} / -{val_negative:,}"
+    )
+    logger.info(
+        "Feature extraction missing records — "
+        f"Source1: {missing_source1_feature_records:,}; "
+        f"S2/S3 candidates: {missing_candidate_feature_records:,}"
     )
     logger.info(
         f"Blocking recall — train: {train_recall:.6f} "
